@@ -78,6 +78,7 @@ parser.add_argument('--view', type=int, default=6, choices=[4, 6], help='Number 
 parser.add_argument('--no_rembg', action='store_true', help='Do not remove input background.')
 parser.add_argument('--export_texmap', action='store_true', help='Export a mesh with texture map.')
 parser.add_argument('--save_video', action='store_true', help='Save a circular-view video.')
+parser.add_argument('--rescale_mesh_to', type=float, default=None, help='Rescale mesh to a given size along longest axis.')
 args = parser.parse_args()
 seed_everything(args.seed)
 
@@ -227,10 +228,11 @@ for idx, sample in enumerate(outputs):
                 mesh_tex_idx.data.cpu().numpy(),
                 tex_map.permute(1, 2, 0).data.cpu().numpy(),
                 mesh_path_idx,
+                rescale_mesh_to=args.rescale_mesh_to,
             )
         else:
             vertices, faces, vertex_colors = mesh_out
-            save_obj(vertices, faces, vertex_colors, mesh_path_idx)
+            save_obj(vertices, faces, vertex_colors, mesh_path_idx, rescale_mesh_to=args.rescale_mesh_to)
         print(f"Mesh saved to {mesh_path_idx}")
 
         # get video
