@@ -50,6 +50,9 @@ pip install xformers==0.0.22.post7
 # Install other requirements
 pip install -r requirements.txt
 
+# Install onnxruntime-gpu and onnxruntime
+pip install onnxruntime-gpu onnxruntime
+
 # Install a different version of accelerator without causing other problems
 pip install accelerate==0.21.0 --no-deps
 ```
