@@ -1,4 +1,7 @@
+# app.py — cleaned up, robust RGB handling, safer State passing, clearer errors
 import os
+import tempfile
+
 import imageio
 import numpy as np
 import torch
@@ -7,234 +10,324 @@ from PIL import Image
 from torchvision.transforms import v2
 from pytorch_lightning import seed_everything
 from omegaconf import OmegaConf
-from einops import rearrange, repeat
+from einops import rearrange
 from tqdm import tqdm
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
+from huggingface_hub import hf_hub_download
+
+import gradio as gr
 
 from src.utils.train_util import instantiate_from_config
 from src.utils.camera_util import (
-    FOV_to_intrinsics, 
+    FOV_to_intrinsics,
     get_zero123plus_input_cameras,
     get_circular_camera_poses,
 )
 from src.utils.mesh_util import save_obj, save_glb
-from src.utils.infer_util import remove_background, resize_foreground, images_to_video
+from src.utils.infer_util import remove_background, resize_foreground
 
-import tempfile
-from huggingface_hub import hf_hub_download
-
-
+# ---------------------------------------------------------------------
+# Device setup
+# ---------------------------------------------------------------------
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
-    device0 = torch.device('cuda:0')
-    device1 = torch.device('cuda:1')
+    device0 = torch.device("cuda:0")
+    device1 = torch.device("cuda:1")
 else:
-    device0 = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device0 = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device1 = device0
 
-# Define the cache directory for model files
-model_cache_dir = './ckpts/'
+device = device0 if device0.type == "cuda" else torch.device("cpu")
+
+# ---------------------------------------------------------------------
+# Model cache dir
+# ---------------------------------------------------------------------
+model_cache_dir = "./ckpts/"
 os.makedirs(model_cache_dir, exist_ok=True)
 
+# ---------------------------------------------------------------------
+# Cameras
+# ---------------------------------------------------------------------
 def get_render_cameras(batch_size=1, M=120, radius=2.5, elevation=10.0, is_flexicubes=False):
     """
     Get the rendering camera parameters.
+
+    Returns
+    -------
+    cameras : torch.Tensor
+        If is_flexicubes: (B, M, 4, 4) camera-to-world inverses (i.e., world-to-camera).
+        Else: (B, M, 24) flattened extrinsics (3x4) + intrinsics (3x3).
     """
     c2ws = get_circular_camera_poses(M=M, radius=radius, elevation=elevation)
     if is_flexicubes:
-        cameras = torch.linalg.inv(c2ws)
+        cameras = torch.linalg.inv(c2ws)                   # (M, 4, 4)
         cameras = cameras.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     else:
-        extrinsics = c2ws.flatten(-2)
-        intrinsics = FOV_to_intrinsics(30.0).unsqueeze(0).repeat(M, 1, 1).float().flatten(-2)
-        cameras = torch.cat([extrinsics, intrinsics], dim=-1)
+        extrinsics = c2ws.flatten(-2)                      # (M, 16)
+        intrinsics = (
+            FOV_to_intrinsics(30.0).unsqueeze(0).repeat(M, 1, 1).float().flatten(-2)
+        )                                                  # (M, 9)
+        cameras = torch.cat([extrinsics, intrinsics], dim=-1)  # (M, 25)
         cameras = cameras.unsqueeze(0).repeat(batch_size, 1, 1)
     return cameras
 
 
+# ---------------------------------------------------------------------
+# Video writer (keep name used later; avoid shadowing imported names)
+# ---------------------------------------------------------------------
 def images_to_video(images, output_path, fps=30):
-    # images: (N, C, H, W)
+    """
+    Write a sequence of CHW images in [0,1] to mp4 (H.264).
+
+    Parameters
+    ----------
+    images : torch.Tensor
+        Shape (N, C, H, W), values in [0,1].
+    output_path : str
+    fps : int
+    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    if not isinstance(images, torch.Tensor):
+        raise TypeError(f"images must be torch.Tensor, got {type(images)}")
+    if images.ndim != 4 or images.shape[1] not in (1, 3, 4):
+        raise ValueError(f"images must be (N,C,H,W) with C in {{1,3,4}}, got {tuple(images.shape)}")
+
     frames = []
     for i in range(images.shape[0]):
-        frame = (images[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).clip(0, 255)
-        assert frame.shape[0] == images.shape[2] and frame.shape[1] == images.shape[3], \
-            f"Frame shape mismatch: {frame.shape} vs {images.shape}"
-        assert frame.min() >= 0 and frame.max() <= 255, \
-            f"Frame value out of range: {frame.min()} ~ {frame.max()}"
+        # (C,H,W) -> (H,W,C)
+        frame = images[i].permute(1, 2, 0).detach().cpu().numpy()
+        # drop alpha if present
+        if frame.shape[2] == 4:
+            frame = frame[..., :3]
+        frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
         frames.append(frame)
-    imageio.mimwrite(output_path, np.stack(frames), fps=fps, codec='h264')
+
+    imageio.mimwrite(output_path, np.stack(frames, axis=0), fps=fps, codec="h264")
 
 
-###############################################################################
-# Configuration.
-###############################################################################
-
+# ---------------------------------------------------------------------
+# Seed and config
+# ---------------------------------------------------------------------
 seed_everything(0)
 
-config_path = 'configs/instant-mesh-large.yaml'
+config_path = "configs/instant-mesh-large.yaml"
 config = OmegaConf.load(config_path)
-config_name = os.path.basename(config_path).replace('.yaml', '')
+config_name = os.path.basename(config_path).replace(".yaml", "")
 model_config = config.model_config
 infer_config = config.infer_config
 
-IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
+IS_FLEXICUBES = True if config_name.startswith("instant-mesh") else False
 
-device = torch.device('cuda')
-
-# load diffusion model
-print('Loading diffusion model ...')
+# ---------------------------------------------------------------------
+# Load diffusion model (Zero123++)
+# ---------------------------------------------------------------------
+print("Loading diffusion model ...")
 pipeline = DiffusionPipeline.from_pretrained(
-    "sudo-ai/zero123plus-v1.2", 
+    "sudo-ai/zero123plus-v1.2",
     custom_pipeline="zero123plus",
-    torch_dtype=torch.float16,
-    cache_dir=model_cache_dir
+    torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+    cache_dir=model_cache_dir,
 )
 pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
-    pipeline.scheduler.config, timestep_spacing='trailing'
+    pipeline.scheduler.config, timestep_spacing="trailing"
 )
 
-# load custom white-background UNet
-unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="diffusion_pytorch_model.bin", repo_type="model", cache_dir=model_cache_dir)
-state_dict = torch.load(unet_ckpt_path, map_location='cpu')
+# Load custom white-background UNet
+unet_ckpt_path = hf_hub_download(
+    repo_id="TencentARC/InstantMesh",
+    filename="diffusion_pytorch_model.bin",
+    repo_type="model",
+    cache_dir=model_cache_dir,
+)
+state_dict = torch.load(unet_ckpt_path, map_location="cpu")
 pipeline.unet.load_state_dict(state_dict, strict=True)
 
 pipeline = pipeline.to(device0)
 
-# load reconstruction model
-print('Loading reconstruction model ...')
-model_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="instant_mesh_large.ckpt", repo_type="model", cache_dir=model_cache_dir)
+# ---------------------------------------------------------------------
+# Load reconstruction model (InstantMesh)
+# ---------------------------------------------------------------------
+print("Loading reconstruction model ...")
+model_ckpt_path = hf_hub_download(
+    repo_id="TencentARC/InstantMesh",
+    filename="instant_mesh_large.ckpt",
+    repo_type="model",
+    cache_dir=model_cache_dir,
+)
 model = instantiate_from_config(model_config)
-state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
-state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.') and 'source_camera' not in k}
-model.load_state_dict(state_dict, strict=True)
+ckpt = torch.load(model_ckpt_path, map_location="cpu")["state_dict"]
+ckpt = {k[14:]: v for k, v in ckpt.items() if k.startswith("lrm_generator.") and "source_camera" not in k}
+model.load_state_dict(ckpt, strict=True)
 
 model = model.to(device1)
 if IS_FLEXICUBES:
     model.init_flexicubes_geometry(device1, fovy=30.0)
 model = model.eval()
 
-print('Loading Finished!')
+print("Loading Finished!")
+
+# ---------------------------------------------------------------------
+# Gradio pipeline functions
+# ---------------------------------------------------------------------
+def _ensure_rgb(pil_img: Image.Image) -> Image.Image:
+    """Force an Image to RGB."""
+    if not isinstance(pil_img, Image.Image):
+        raise TypeError(f"Expected PIL.Image.Image, got {type(pil_img)}")
+    if pil_img.mode != "RGB":
+        return pil_img.convert("RGB")
+    return pil_img
 
 
 def check_input_image(input_image):
     if input_image is None:
         raise gr.Error("No image uploaded!")
+    # Normalize to RGB early so downstream never sees RGBA
+    if isinstance(input_image, Image.Image) and input_image.mode != "RGB":
+        input_image = input_image.convert("RGB")
     return input_image
 
 
 def preprocess(input_image, do_remove_background):
+    """
+    Removes background (optional), resizes the foreground, and ensures RGB.
+    """
+    if input_image is None:
+        raise gr.Error("No image to preprocess!")
 
     rembg_session = rembg.new_session() if do_remove_background else None
-    if do_remove_background:
-        input_image = remove_background(input_image, rembg_session)
-        input_image = resize_foreground(input_image, 0.85)
+    out_img = input_image
 
-    return input_image
+    if do_remove_background:
+        out_img = remove_background(out_img, rembg_session)  # may be RGBA
+        out_img = resize_foreground(out_img, 0.85)
+
+        # Composite over white (white-background UNet)
+        if isinstance(out_img, Image.Image) and out_img.mode == "RGBA":
+            bg = Image.new("RGB", out_img.size, (255, 255, 255))
+            bg.paste(out_img, mask=out_img.split()[-1])
+            out_img = bg
+
+    # Ensure RGB regardless
+    out_img = _ensure_rgb(out_img)
+    return out_img
 
 
 def generate_mvs(input_image, sample_steps, sample_seed):
+    """
+    Runs Zero123++ to generate the tiled multi-view image.
+    Returns:
+      - mv_images_state: the same PIL image (stored in Gradio State)
+      - show_image: PIL for display
+    """
+    # Gradio Number yields float; cast to int
+    sample_steps = int(sample_steps)
+    sample_seed = int(sample_seed)
+
     seed_everything(sample_seed)
-    
-    breakpoint()
-    generator = torch.Generator(device=device0)
-    z123_image = pipeline(
-        input_image, 
-        num_inference_steps=sample_steps, 
+    input_image = _ensure_rgb(input_image)
+
+    generator = torch.Generator(device=device0).manual_seed(sample_seed)
+    result = pipeline(
+        input_image,
+        num_inference_steps=sample_steps,
         generator=generator,
-    ).images[0]  # PIL.Image.Image, RGB
+    )
+    z123_image = result.images[0]  # PIL RGB
 
-    # For display: keep as PIL.Image
     show_image = z123_image
-
-    # For Gradio State: convert to NumPy array then to list
-    mv_images_state = np.array(z123_image).tolist()  # JSON-serializable
+    # mv_images_state: store as numpy to make State robust across threads/workers
+    mv_images_state = np.array(z123_image, dtype=np.uint8)  # (H, W, 3)
 
     return mv_images_state, show_image
 
 
-def make_mesh(mesh_fpath, planes):
+def _pil_or_numpy_to_rgb_numpy(img):
+    """
+    Accept PIL or NumPy; return HxWx3 uint8 NumPy array.
+    """
+    if isinstance(img, Image.Image):
+        img = _ensure_rgb(img)
+        return np.array(img, dtype=np.uint8)
 
-    mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
-    mesh_dirname = os.path.dirname(mesh_fpath)
-    mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
-        
-    with torch.no_grad():
-        # get mesh
+    if isinstance(img, np.ndarray):
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[..., :3]
+        if img.ndim != 3 or img.shape[2] != 3:
+            raise ValueError(f"Expected images of shape (H,W,3), got {img.shape}")
+        if img.dtype != np.uint8:
+            # Assume in [0,1] or general float; clip and convert
+            img = np.clip(img, 0, 1) if img.dtype.kind == "f" else img
+            img = (img * 255.0).astype(np.uint8) if img.dtype.kind == "f" else img.astype(np.uint8)
+        return img
 
-        mesh_out = model.extract_mesh(
-            planes,
-            use_texture_map=False,
-            **infer_config,
-        )
-
-        vertices, faces, vertex_colors = mesh_out
-        vertices = vertices[:, [1, 2, 0]]
-        
-        save_glb(vertices, faces, vertex_colors, mesh_glb_fpath)
-        save_obj(vertices, faces, vertex_colors, mesh_fpath)
-        
-        print(f"Mesh saved to {mesh_fpath}")
-
-    return mesh_fpath, mesh_glb_fpath
-
+    raise TypeError(f"Unsupported type for images: {type(img)}")
 
 def make3d(images):
+    """
+    Convert a tiled multi-view image into a 3D mesh and a turntable video.
+    Returns:
+      - video_fpath, mesh_fpath (obj), mesh_glb_fpath (glb)
+    """
+    if images is None:
+        # Give a clear error that helps the user
+        raise gr.Error(
+            "No multi-view image found from the previous step. "
+            "Please click Generate again (and ensure the multi-views appear) before running 3D."
+        )
 
-    breakpoint()
-    # images comes from State → JSON list → convert back to NumPy array
-    images = np.array(images, dtype=np.float32) / 255.0
+    # Accept PIL or NumPy from State; ensure HxWx3 uint8
+    images_np = _pil_or_numpy_to_rgb_numpy(images)  # (H,W,3) uint8
 
-    # If your images are RGB, shape should be (H,W,C)
-    if images.ndim != 3 or images.shape[2] != 3:
-        raise ValueError(f"Expected images of shape (H,W,3), got {images.shape}")
+    # Convert to float CHW in [0,1]
+    images_t = torch.from_numpy(images_np).float() / 255.0  # (H,W,3)
+    images_t = images_t.permute(2, 0, 1).contiguous()       # (C,H,W)
 
-    images = torch.from_numpy(images).permute(2, 0, 1).contiguous().float()  # (C,H,W)
-    images = rearrange(images, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)
+    # Your original code assumes a 3x2 grid -> 6 views
+    # Fail-fast with a clear error if not divisible
+    H, W = images_t.shape[1], images_t.shape[2]
+    n, m = 3, 2
+    if (H % n) != 0 or (W % m) != 0:
+        raise ValueError(
+            f"Multi-view tile size not divisible by ({n},{m}): got (H,W)=({H},{W}). "
+            "This likely means the Zero123++ grid layout changed. Adjust (n,m) to match."
+        )
+
+    images_t = rearrange(images_t, "c (n h) (m w) -> (n m) c h w", n=n, m=m)  # (6, C, h, w)
 
     input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0).to(device1)
     render_cameras = get_render_cameras(
-        batch_size=1, radius=4.5, elevation=20.0, is_flexicubes=IS_FLEXICUBES).to(device1)
+        batch_size=1, radius=4.5, elevation=20.0, is_flexicubes=IS_FLEXICUBES
+    ).to(device1)
 
-    images = images.unsqueeze(0).to(device1)
-    images = v2.functional.resize(images, (320, 320), interpolation=3, antialias=True).clamp(0, 1)
+    images_t = images_t.unsqueeze(0).to(device1)  # (B=1, 6, C, h, w)
+    images_t = v2.functional.resize(images_t, (320, 320), interpolation=3, antialias=True).clamp(0, 1)
 
-    mesh_fpath = tempfile.NamedTemporaryFile(suffix=f".obj", delete=False).name
-    print(mesh_fpath)
-    mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
+    mesh_fpath = tempfile.NamedTemporaryFile(suffix=".obj", delete=False).name
+    mesh_basename = os.path.basename(mesh_fpath).split(".")[0]
     mesh_dirname = os.path.dirname(mesh_fpath)
     video_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.mp4")
 
     with torch.no_grad():
         # get triplane
-        planes = model.forward_planes(images, input_cameras)
+        planes = model.forward_planes(images_t, input_cameras)
 
-        # get video
+        # get turntable video
         chunk_size = 20 if IS_FLEXICUBES else 1
         render_size = 384
-        
+
         frames = []
         for i in tqdm(range(0, render_cameras.shape[1], chunk_size)):
             if IS_FLEXICUBES:
-                frame = model.forward_geometry(
-                    planes,
-                    render_cameras[:, i:i+chunk_size],
-                    render_size=render_size,
-                )['img']
+                out = model.forward_geometry(
+                    planes, render_cameras[:, i : i + chunk_size], render_size=render_size
+                )["img"]
             else:
-                frame = model.synthesizer(
-                    planes,
-                    cameras=render_cameras[:, i:i+chunk_size],
-                    render_size=render_size,
-                )['images_rgb']
-            frames.append(frame)
-        frames = torch.cat(frames, dim=1)
+                out = model.synthesizer(
+                    planes, cameras=render_cameras[:, i : i + chunk_size], render_size=render_size
+                )["images_rgb"]
+            frames.append(out)
+        frames = torch.cat(frames, dim=1)  # (B=1, M, C, H, W)
 
-        images_to_video(
-            frames[0],
-            video_fpath,
-            fps=30,
-        )
-
+        images_to_video(frames[0], video_fpath, fps=30)
         print(f"Video saved to {video_fpath}")
 
     mesh_fpath, mesh_glb_fpath = make_mesh(mesh_fpath, planes)
@@ -242,7 +335,27 @@ def make3d(images):
     return video_fpath, mesh_fpath, mesh_glb_fpath
 
 
-import gradio as gr
+def make_mesh(mesh_fpath, planes):
+    mesh_basename = os.path.basename(mesh_fpath).split(".")[0]
+    mesh_dirname = os.path.dirname(mesh_fpath)
+    mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
+
+    with torch.no_grad():
+        mesh_out = model.extract_mesh(
+            planes,
+            use_texture_map=False,
+            **infer_config,
+        )
+        vertices, faces, vertex_colors = mesh_out
+        vertices = vertices[:, [1, 2, 0]]  # align axis
+
+        save_glb(vertices, faces, vertex_colors, mesh_glb_fpath)
+        save_obj(vertices, faces, vertex_colors, mesh_fpath)
+        print(f"Mesh saved to {mesh_fpath}")
+
+    return mesh_fpath, mesh_glb_fpath
+
+
 
 _HEADER_ = '''
 <h2><b>Official 🤗 Gradio Demo</b></h2><h2><a href='https://github.com/TencentARC/InstantMesh' target='_blank'><b>InstantMesh: Efficient 3D Mesh Generation from a Single Image with Sparse-view Large Reconstruction Models</b></a></h2>
@@ -383,7 +496,7 @@ with gr.Blocks() as demo:
     ).then(
         fn=make3d,
         inputs=[mv_images],
-        outputs=[output_video, output_model_obj, output_model_glb]
+        outputs=[output_video, output_model_obj, output_model_glb],
     )
 
 demo.queue(max_size=10)
