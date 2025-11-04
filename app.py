@@ -119,6 +119,7 @@ print('Loading Finished!')
 def check_input_image(input_image):
     if input_image is None:
         raise gr.Error("No image uploaded!")
+    return input_image
 
 
 def preprocess(input_image, do_remove_background):
@@ -132,24 +133,23 @@ def preprocess(input_image, do_remove_background):
 
 
 def generate_mvs(input_image, sample_steps, sample_seed):
-
     seed_everything(sample_seed)
     
-    # sampling
+    breakpoint()
     generator = torch.Generator(device=device0)
     z123_image = pipeline(
         input_image, 
         num_inference_steps=sample_steps, 
         generator=generator,
-    ).images[0]
+    ).images[0]  # PIL.Image.Image, RGB
 
-    show_image = np.asarray(z123_image, dtype=np.uint8)
-    show_image = torch.from_numpy(show_image)     # (960, 640, 3)
-    show_image = rearrange(show_image, '(n h) (m w) c -> (n m) h w c', n=3, m=2)
-    show_image = rearrange(show_image, '(n m) h w c -> (n h) (m w) c', n=2, m=3)
-    show_image = Image.fromarray(show_image.numpy())
+    # For display: keep as PIL.Image
+    show_image = z123_image
 
-    return z123_image, show_image
+    # For Gradio State: convert to NumPy array then to list
+    mv_images_state = np.array(z123_image).tolist()  # JSON-serializable
+
+    return mv_images_state, show_image
 
 
 def make_mesh(mesh_fpath, planes):
@@ -180,9 +180,16 @@ def make_mesh(mesh_fpath, planes):
 
 def make3d(images):
 
-    images = np.asarray(images, dtype=np.float32) / 255.0
-    images = torch.from_numpy(images).permute(2, 0, 1).contiguous().float()     # (3, 960, 640)
-    images = rearrange(images, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)        # (6, 3, 320, 320)
+    breakpoint()
+    # images comes from State → JSON list → convert back to NumPy array
+    images = np.array(images, dtype=np.float32) / 255.0
+
+    # If your images are RGB, shape should be (H,W,C)
+    if images.ndim != 3 or images.shape[2] != 3:
+        raise ValueError(f"Expected images of shape (H,W,3), got {images.shape}")
+
+    images = torch.from_numpy(images).permute(2, 0, 1).contiguous().float()  # (C,H,W)
+    images = rearrange(images, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)
 
     input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0).to(device1)
     render_cameras = get_render_cameras(
@@ -281,11 +288,9 @@ with gr.Blocks() as demo:
                 input_image = gr.Image(
                     label="Input Image",
                     image_mode="RGBA",
-                    sources="upload",
                     width=256,
                     height=256,
                     type="pil",
-                    elem_id="content_image",
                 )
                 processed_image = gr.Image(
                     label="Processed Image", 
@@ -331,14 +336,12 @@ with gr.Blocks() as demo:
                     mv_show_images = gr.Image(
                         label="Generated Multi-views",
                         type="pil",
-                        width=379,
                         interactive=False
                     )
 
                 with gr.Column():
                     output_video = gr.Video(
                         label="video", format="mp4",
-                        width=379,
                         autoplay=True,
                         interactive=False
                     )
@@ -365,15 +368,19 @@ with gr.Blocks() as demo:
     gr.Markdown(_CITE_)
     mv_images = gr.State()
 
-    submit.click(fn=check_input_image, inputs=[input_image]).success(
-        fn=preprocess,
-        inputs=[input_image, do_remove_background],
+    submit.click(
+        fn=check_input_image,
+        inputs=[input_image],
         outputs=[processed_image],
-    ).success(
+    ).then(
+        fn=preprocess,
+        inputs=[processed_image, do_remove_background],
+        outputs=[processed_image],
+    ).then(
         fn=generate_mvs,
         inputs=[processed_image, sample_steps, sample_seed],
         outputs=[mv_images, mv_show_images],
-    ).success(
+    ).then(
         fn=make3d,
         inputs=[mv_images],
         outputs=[output_video, output_model_obj, output_model_glb]
