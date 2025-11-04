@@ -15,7 +15,7 @@ import nvdiffrast.torch as dr
 from PIL import Image
 
 
-def save_obj(pointnp_px3, facenp_fx3, colornp_px3, fpath):
+def save_obj(pointnp_px3, facenp_fx3, colornp_px3, fpath, rescale_mesh_to=None):
 
     pointnp_px3 = pointnp_px3 @ np.array([[1, 0, 0], [0, 1, 0], [0, 0, -1]])
     facenp_fx3 = facenp_fx3[:, [2, 1, 0]]
@@ -25,6 +25,13 @@ def save_obj(pointnp_px3, facenp_fx3, colornp_px3, fpath):
         faces=facenp_fx3, 
         vertex_colors=colornp_px3,
     )
+    if rescale_mesh_to is not None:
+        bounds = mesh.bounds
+        assert bounds.shape == (2, 3), f"Bounds shape should be (2, 3), got {bounds.shape}"
+        max_dim = np.max(bounds[1] - bounds[0])
+        scale_factor = rescale_mesh_to / max_dim
+        mesh.apply_scale(scale_factor)
+
     mesh.export(fpath, 'obj')
 
 
@@ -40,7 +47,10 @@ def save_glb(pointnp_px3, facenp_fx3, colornp_px3, fpath):
     mesh.export(fpath, 'glb')
 
 
-def save_obj_with_mtl(pointnp_px3, tcoords_px2, facenp_fx3, facetex_fx3, texmap_hxwx3, fname):
+def save_obj_with_mtl(pointnp_px3, tcoords_px2, facenp_fx3, facetex_fx3, texmap_hxwx3, fname, rescale_mesh_to=None):
+    if rescale_mesh_to is not None:
+        raise NotImplementedError("Rescaling mesh to a given size along longest axis is not implemented for obj with mtl.")
+
     import os
     fol, na = os.path.split(fname)
     na, _ = os.path.splitext(na)
