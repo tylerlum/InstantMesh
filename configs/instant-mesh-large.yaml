@@ -9,9 +9,9 @@ model_config:
     transformer_heads: 16
     triplane_low_res: 32
     triplane_high_res: 64
-    triplane_dim: 80
-    rendering_samples_per_ray: 128
-    grid_res: 128
+    triplane_dim: 80        # ⚠️ keep this unchanged — tied to checkpoint
+    rendering_samples_per_ray: 96   # ↓ reduced from 128
+    grid_res: 96                    # ↓ reduced from 128
     grid_scale: 2.1
 
 
@@ -19,4 +19,4 @@ infer_config:
   unet_path: ckpts/diffusion_pytorch_model.bin
   model_path: ckpts/instant_mesh_large.ckpt
   texture_resolution: 1024
-  render_resolution: 512
+  render_resolution: 384           # ↓ reduced from 512
