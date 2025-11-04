@@ -13,6 +13,50 @@
 
 ---
 
+# UPDATED README (November 3, 2025)
+
+The current version of `InstantMesh` gives the following error on the HuggingFace demo (https://huggingface.co/spaces/TencentARC/InstantMesh):
+
+```
+runtime error
+Exit code: 1. Reason: Traceback (most recent call last):
+  File "/home/user/app/app.py", line 7, in <module>
+    import rembg
+  File "/usr/local/lib/python3.10/site-packages/rembg/__init__.py", line 5, in <module>
+    from .bg import remove
+  File "/usr/local/lib/python3.10/site-packages/rembg/bg.py", line 7, in <module>
+    import onnxruntime as ort
+ModuleNotFoundError: No module named 'onnxruntime'
+```
+
+Thus, I cloned the repo locally and made changes to make it work. These changes include small changes to the requirements.txt and an extra command to run to avoid dependency conflicts.
+
+```bash
+conda create --name instantmesh python=3.10
+conda activate instantmesh
+pip install -U pip
+
+# Ensure Ninja is installed
+conda install Ninja
+
+# Install the correct version of CUDA
+conda install cuda -c nvidia/label/cuda-12.1.0
+
+# Install PyTorch and xformers
+# You may need to install another xformers version if you use a different PyTorch version
+pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+pip install xformers==0.0.22.post7
+
+# Install other requirements
+pip install -r requirements.txt
+
+# Install a different version of accelerator without causing other problems
+pip install accelerate==0.21.0 --no-deps
+```
+
+
+# ORIGINAL README BELOW
+
 This repo is the official implementation of InstantMesh, a feed-forward framework for efficient 3D mesh generation from a single image based on the LRM/Instant3D architecture.
 
 https://github.com/TencentARC/InstantMesh/assets/20635237/dab3511e-e7c6-4c0b-bab7-15772045c47d
